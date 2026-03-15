@@ -7,54 +7,79 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'sentinel-proxy v3' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'sentinel-proxy v4' }));
+
+// Cache to avoid hammering Twitter
+const cache = {};
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 app.get('/twitter/:handle', async (req, res) => {
   const handle = req.params.handle;
+  
+  // Return cache if fresh
+  if (cache[handle] && Date.now() - cache[handle].ts < CACHE_TTL) {
+    return res.json(cache[handle].data);
+  }
+
   try {
-    // Use Twitter's own embed oEmbed endpoint — works from any IP
     const tweets = [];
     
-    // Fetch the Twitter profile page via a public scraping service
-    const url = `https://publish.twitter.com/oembed?url=https://twitter.com/${handle}&omit_script=true`;
-    const r = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)',
-        'Accept': 'application/json'
-      }
-    });
-    
-    if (!r.ok) {
-      return res.json({ tweets: [], error: `oEmbed ${r.status}` });
-    }
-    
-    const data = await r.json();
-    // oEmbed returns latest tweet HTML — extract text
-    const html = data.html || '';
-    const textMatch = html.match(/<p[^>]*>(.*?)<\/p>/s);
-    if (textMatch) {
-      const text = textMatch[1]
-        .replace(/<a[^>]*>.*?<\/a>/gs, '')
-        .replace(/<[^>]+>/g, '')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&#39;/g, "'")
-        .trim();
-      
-      if (text) {
-        tweets.push({
-          text,
-          time: new Date().toISOString(),
-          url: `https://x.com/${handle}`
+    // Try multiple public tweet sources
+    const sources = [
+      // Nitter public instances - RSS
+      `https://nitter.privacydev.net/${handle}/rss`,
+      `https://nitter.poast.org/${handle}/rss`,
+      `https://nitter.net/${handle}/rss`,
+      `https://nitter.cz/${handle}/rss`,
+    ];
+
+    for (const src of sources) {
+      try {
+        const r = await fetch(src, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.google.com/',
+          },
+          timeout: 8000
         });
-      }
+        
+        if (!r.ok) continue;
+        const xml = await r.text();
+        if (!xml || !xml.includes('<item')) continue;
+
+        // Parse RSS
+        const items = xml.match(/<item>([\s\S]*?)<\/item>/gi) || [];
+        for (const item of items.slice(0, 6)) {
+          const titleMatch = item.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/);
+          const linkMatch = item.match(/<link>(.*?)<\/link>/);
+          const dateMatch = item.match(/<pubDate>(.*?)<\/pubDate>/);
+          
+          if (!titleMatch) continue;
+          let text = titleMatch[1]
+            .replace(/^R @\S+: /i, '')
+            .replace(/^RT @\S+: /i, '')
+            .trim();
+          
+          if (!text || text.length < 5) continue;
+          tweets.push({
+            text,
+            time: dateMatch ? dateMatch[1] : new Date().toISOString(),
+            url: linkMatch ? linkMatch[1].trim() : `https://x.com/${handle}`
+          });
+        }
+        
+        if (tweets.length > 0) break; // Got tweets, stop trying sources
+      } catch (e) { continue; }
     }
-    
-    res.json({ tweets, ok: true });
+
+    const result = { tweets, ok: true, count: tweets.length };
+    cache[handle] = { ts: Date.now(), data: result };
+    res.json(result);
   } catch (e) {
     res.json({ tweets: [], error: e.message });
   }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('Sentinel proxy v3 running'));
+app.listen(process.env.PORT || 3000, () => console.log('Sentinel proxy v4 running'));
